@@ -1,0 +1,1 @@
+"""Telegram Bot Lambda handler."""

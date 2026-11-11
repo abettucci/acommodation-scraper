@@ -1,0 +1,142 @@
+name: Deploy Lambdas
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'aws/lambdas/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+      lambda:
+        description: 'Lambda to deploy (or "all")'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - telegram_bot
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: accommodation-scraper
+
+jobs:
+  detect-changes:
+    name: Detect Changed Lambdas
+    runs-on: ubuntu-latest
+    outputs:
+      lambdas: ${{ steps.detect.outputs.lambdas }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed lambdas
+        id: detect
+        run: |
+          if [ "${{ github.event.inputs.lambda }}" = "all" ] || [ -z "${{ github.event.inputs.lambda }}" ]; then
+            # Check if shared code changed
+            SHARED_CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -c "aws/lambdas/shared/" || true)
+            
+            if [ "$SHARED_CHANGED" -gt 0 ]; then
+              echo "Shared code changed - deploying all lambdas"
+              LAMBDAS='["telegram_bot"]'
+            else
+              # Detect individual lambda changes
+              CHANGED_LAMBDAS=$(git diff --name-only HEAD~1 HEAD | grep "aws/lambdas/" | grep -v "shared/" | cut -d'/' -f3 | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+              LAMBDAS="${CHANGED_LAMBDAS:-[]}"
+            fi
+          else
+            LAMBDAS='["${{ github.event.inputs.lambda }}"]'
+          fi
+          
+          echo "lambdas=${LAMBDAS}" >> $GITHUB_OUTPUT
+          echo "Lambdas to deploy: ${LAMBDAS}"
+
+  deploy:
+    name: Deploy Lambda
+    needs: detect-changes
+    if: needs.detect-changes.outputs.lambdas != '[]'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    strategy:
+      matrix:
+        lambda: ${{ fromJson(needs.detect-changes.outputs.lambdas) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set environment
+        id: env
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "function_name=${PROJECT_NAME}-${ENV}-${{ matrix.lambda }}" >> $GITHUB_OUTPUT
+
+      - name: Package Lambda
+        run: |
+          mkdir -p dist
+          
+          # Copy lambda code
+          cp -r aws/lambdas/${{ matrix.lambda }}/* dist/
+          
+          # Copy shared code
+          cp -r aws/lambdas/shared dist/
+          
+          # Install lambda-specific requirements if exists
+          if [ -f "aws/lambdas/${{ matrix.lambda }}/requirements.txt" ]; then
+            pip install -r aws/lambdas/${{ matrix.lambda }}/requirements.txt -t dist/
+          fi
+          
+          # Create zip
+          cd dist
+          zip -r ../lambda-${{ matrix.lambda }}.zip .
+          cd ..
+          
+          echo "📦 Package created:"
+          ls -lh lambda-${{ matrix.lambda }}.zip
+
+      - name: Deploy Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ steps.env.outputs.function_name }} \
+            --zip-file fileb://lambda-${{ matrix.lambda }}.zip \
+            --publish
+          
+          echo "✅ Deployed ${{ matrix.lambda }} to ${{ steps.env.outputs.function_name }}"
+
+  summary:
+    name: Deployment Summary
+    needs: [detect-changes, deploy]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summary
+        run: |
+          echo "## 🚀 Lambda Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Lambdas:** ${{ needs.detect-changes.outputs.lambdas }}" >> $GITHUB_STEP_SUMMARY

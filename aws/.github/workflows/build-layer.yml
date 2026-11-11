@@ -1,0 +1,99 @@
+name: Build Lambda Layer
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'aws/layers/**'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: accommodation-scraper
+
+jobs:
+  build:
+    name: Build and Publish Layer
+    runs-on: ubuntu-latest
+    outputs:
+      layer_arn: ${{ steps.publish.outputs.layer_arn }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build layer with Docker
+        run: |
+          cd aws/layers/dependencies
+          
+          # Build Docker image
+          docker build -t ${PROJECT_NAME}-layer .
+          
+          # Create output directory
+          mkdir -p output
+          
+          # Run container to extract layer.zip
+          docker run --rm -v "$(pwd)/output:/output" ${PROJECT_NAME}-layer
+          
+          # Verify
+          ls -lh output/layer.zip
+
+      - name: Publish Lambda Layer
+        id: publish
+        run: |
+          LAYER_NAME="${PROJECT_NAME}-dependencies"
+          
+          # Publish new layer version
+          RESULT=$(aws lambda publish-layer-version \
+            --layer-name ${LAYER_NAME} \
+            --description "Dependencies for ${PROJECT_NAME}" \
+            --zip-file fileb://aws/layers/dependencies/output/layer.zip \
+            --compatible-runtimes python3.11 \
+            --compatible-architectures x86_64)
+          
+          LAYER_ARN=$(echo $RESULT | jq -r '.LayerVersionArn')
+          VERSION=$(echo $RESULT | jq -r '.Version')
+          
+          echo "layer_arn=${LAYER_ARN}" >> $GITHUB_OUTPUT
+          echo "✅ Published layer version ${VERSION}"
+          echo "ARN: ${LAYER_ARN}"
+
+  update-lambdas:
+    name: Update Lambdas with New Layer
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, prod]
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update Lambda layers
+        run: |
+          LAYER_ARN="${{ needs.build.outputs.layer_arn }}"
+          FUNCTION_NAME="${PROJECT_NAME}-${{ matrix.environment }}-telegram-bot"
+          
+          # Check if function exists
+          if aws lambda get-function --function-name ${FUNCTION_NAME} 2>/dev/null; then
+            aws lambda update-function-configuration \
+              --function-name ${FUNCTION_NAME} \
+              --layers ${LAYER_ARN}
+            
+            echo "✅ Updated ${FUNCTION_NAME} with layer ${LAYER_ARN}"
+          else
+            echo "⚠️ Function ${FUNCTION_NAME} does not exist yet"
+          fi

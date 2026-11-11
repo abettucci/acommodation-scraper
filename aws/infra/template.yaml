@@ -1,0 +1,207 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Accommodation Scraper - Telegram Bot and API infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment environment
+
+  ProjectName:
+    Type: String
+    Default: accommodation-scraper
+    Description: Project name for resource naming
+
+  TelegramBotToken:
+    Type: String
+    NoEcho: true
+    Description: Telegram Bot token from @BotFather
+
+  GooglePlacesApiKey:
+    Type: String
+    NoEcho: true
+    Description: Google Places API key
+
+  LambdaLayerArn:
+    Type: String
+    Description: ARN of the Lambda layer with dependencies
+    Default: ''
+
+Conditions:
+  HasLambdaLayer: !Not [!Equals [!Ref LambdaLayerArn, '']]
+
+Resources:
+  # ============================================
+  # SECRETS MANAGER
+  # ============================================
+  
+  TelegramSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-telegram-token'
+      Description: Telegram Bot token
+      SecretString: !Ref TelegramBotToken
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  GooglePlacesSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-google-places-key'
+      Description: Google Places API key
+      SecretString: !Ref GooglePlacesApiKey
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================
+  # IAM ROLES
+  # ============================================
+  
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref TelegramSecret
+                  - !Ref GooglePlacesSecret
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================
+  # LAMBDA FUNCTIONS
+  # ============================================
+  
+  TelegramBotFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-telegram-bot'
+      Description: Telegram Bot webhook handler for accommodation searches
+      Runtime: python3.11
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !If [HasLambdaLayer, !Ref LambdaLayerArn, !Ref 'AWS::NoValue']
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+          TELEGRAM_SECRET_ARN: !Ref TelegramSecret
+          GOOGLE_PLACES_SECRET_ARN: !Ref GooglePlacesSecret
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"statusCode": 200, "body": "Placeholder - deploy actual code"}
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectName
+
+  TelegramBotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TelegramBotFunction}'
+      RetentionInDays: !If [!Equals [!Ref Environment, 'prod'], 30, 7]
+
+  # ============================================
+  # API GATEWAY (HTTP API)
+  # ============================================
+  
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api'
+      Description: HTTP API for Telegram webhook
+      ProtocolType: HTTP
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  TelegramWebhookIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt TelegramBotFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  TelegramWebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /webhook/telegram'
+      Target: !Sub 'integrations/${TelegramWebhookIntegration}'
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: !Ref Environment
+      AutoDeploy: true
+      Tags:
+        Environment: !Ref Environment
+        Project: !Ref ProjectName
+
+  TelegramBotInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TelegramBotFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+Outputs:
+  TelegramWebhookUrl:
+    Description: URL to set as Telegram webhook
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhook/telegram'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-telegram-webhook-url'
+
+  ApiEndpoint:
+    Description: HTTP API endpoint
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-api-endpoint'
+
+  TelegramBotFunctionArn:
+    Description: Telegram Bot Lambda ARN
+    Value: !GetAtt TelegramBotFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-telegram-bot-arn'
+
+  LambdaRoleArn:
+    Description: Lambda execution role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-lambda-role-arn'

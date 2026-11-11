@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "accommodation-scraper"
+version = "0.1.0"
+description = "CLI scraper for hotels, hostels and accommodations using Google Places API"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "scraper", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+httpx = "^0.27.0"
+typer = "^0.15.0"
+pandas = "^2.2.0"
+python-dotenv = "^1.0.0"
+rich = "^13.7.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.0"
+
+[tool.poetry.scripts]
+scraper = "scraper.cli:app"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

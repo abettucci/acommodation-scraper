@@ -1,0 +1,96 @@
+name: Deploy Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'aws/infra/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+  PROJECT_NAME: accommodation-scraper
+
+jobs:
+  validate:
+    name: Validate CloudFormation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://aws/infra/template.yaml
+
+  deploy:
+    name: Deploy Stack
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set environment
+        id: env
+        run: |
+          ENV="${{ github.event.inputs.environment || 'dev' }}"
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "stack_name=${PROJECT_NAME}-${ENV}" >> $GITHUB_OUTPUT
+
+      - name: Deploy CloudFormation stack
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+          LAMBDA_LAYER_ARN: ${{ secrets.LAMBDA_LAYER_ARN }}
+        run: |
+          aws cloudformation deploy \
+            --template-file aws/infra/template.yaml \
+            --stack-name ${{ steps.env.outputs.stack_name }} \
+            --parameter-overrides \
+              Environment=${{ steps.env.outputs.environment }} \
+              ProjectName=${PROJECT_NAME} \
+              TelegramBotToken=${TELEGRAM_BOT_TOKEN} \
+              GooglePlacesApiKey=${GOOGLE_PLACES_API_KEY} \
+              LambdaLayerArn=${LAMBDA_LAYER_ARN:-""} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --tags Project=${PROJECT_NAME} Environment=${{ steps.env.outputs.environment }}
+
+      - name: Get stack outputs
+        run: |
+          echo "📋 Stack Outputs:"
+          aws cloudformation describe-stacks \
+            --stack-name ${{ steps.env.outputs.stack_name }} \
+            --query 'Stacks[0].Outputs' \
+            --output table
+          
+          echo ""
+          echo "📝 Next step: Set Telegram webhook with the URL above"
